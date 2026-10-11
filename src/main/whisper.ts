@@ -1,10 +1,9 @@
-import { execFile } from 'node:child_process'
+import { execFile, execSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { createReadStream, createWriteStream, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync } from 'node:fs'
 import { cpus } from 'node:os'
 import { join } from 'node:path'
 import { once } from 'node:events'
-import { app, shell } from 'electron'
 import ffmpegStatic from 'ffmpeg-static'
 import type { WhisperStatus } from '@shared/types'
 import { alignWords, splitHeard, type Heard } from './align'
@@ -12,8 +11,8 @@ import { emit } from './events'
 import { binPath, dataDir } from './paths'
 
 /**
- * Local speech recognition with whisper.cpp (bundled `whisper-cli`) and the multilingual Whisper Small
- * model, downloaded once into the app's data folder. Used to time caption words against the real voice.
+ * Local speech recognition with whisper.cpp (bundled `whisper-cli` or system whisper-cli) and the
+ * multilingual Whisper Small model, downloaded into the app's data folder.
  */
 
 const MODEL = {
@@ -29,10 +28,33 @@ export function modelDir(): string {
   return dir
 }
 
-const modelPath = (): string => join(modelDir(), MODEL.file)
+export const modelPath = (): string => join(modelDir(), MODEL.file)
 
-function cliPath(): string {
-  return app.isPackaged ? join(process.resourcesPath, 'whisper', 'whisper-cli.exe') : join(app.getAppPath(), 'resources', 'whisper', 'whisper-cli.exe')
+export function cliPath(): string {
+  if (process.env.WHISPER_PATH && existsSync(process.env.WHISPER_PATH)) {
+    return process.env.WHISPER_PATH
+  }
+
+  // Check bundled Windows binary if on Windows
+  if (process.platform === 'win32') {
+    const bundledWin = join(process.cwd(), 'resources', 'whisper', 'whisper-cli.exe')
+    if (existsSync(bundledWin)) return bundledWin
+  }
+
+  // Check system PATH
+  try {
+    const whichCmd = process.platform === 'win32' ? 'where whisper-cli.exe' : 'which whisper-cli'
+    const found = execSync(whichCmd, { stdio: ['pipe', 'pipe', 'ignore'], encoding: 'utf8' }).trim().split('\n')[0]
+    if (found && existsSync(found)) return found
+  } catch {}
+
+  // Common mac paths
+  if (process.platform === 'darwin') {
+    if (existsSync('/opt/homebrew/bin/whisper-cli')) return '/opt/homebrew/bin/whisper-cli'
+    if (existsSync('/usr/local/bin/whisper-cli')) return '/usr/local/bin/whisper-cli'
+  }
+
+  return process.platform === 'win32' ? 'whisper-cli.exe' : 'whisper-cli'
 }
 
 let download: { ctrl: AbortController; received: number; phase: 'downloading' | 'verifying' } | null = null
@@ -50,7 +72,17 @@ export function whisperStatus(): WhisperStatus {
   }
 }
 
-export const whisperReady = (): boolean => whisperStatus().state === 'ready' && existsSync(cliPath())
+export function whisperReady(): boolean {
+  if (whisperStatus().state !== 'ready') return false
+  const p = cliPath()
+  if (existsSync(p)) return true
+  try {
+    execSync(`${p} -h`, { stdio: 'ignore' })
+    return true
+  } catch {
+    return false
+  }
+}
 
 function sha256(file: string): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -63,7 +95,7 @@ function sha256(file: string): Promise<string> {
 }
 
 /** Downloads the model, resuming a partial file, and checks it against the published SHA-256. */
-export async function downloadModel(): Promise<void> {
+export async function downloadModel(onProgress?: (received: number, total: number) => void): Promise<void> {
   if (download || whisperReady()) return
   const part = `${modelPath()}.part`
   const ctrl = new AbortController()
@@ -74,14 +106,14 @@ export async function downloadModel(): Promise<void> {
     if (force || Date.now() - lastEmit > 250) {
       lastEmit = Date.now()
       emit.whisper(whisperStatus())
+      onProgress?.(download?.received ?? 0, MODEL.bytes)
     }
   }
   report(true)
   try {
     if (download.received < MODEL.bytes) {
       const have = download.received
-      // Development builds can fetch from a local copy (STUDIO_WHISPER_URL) to test resuming.
-      const url = (!app.isPackaged && process.env.STUDIO_WHISPER_URL) || MODEL.url
+      const url = process.env.STUDIO_WHISPER_URL || MODEL.url
       const res = await fetch(url, { headers: have ? { Range: `bytes=${have}-` } : {}, signal: ctrl.signal })
       if (!res.ok || !res.body) throw new Error(`Unduhan gagal (HTTP ${res.status})`)
       const resumed = res.status === 206
@@ -127,7 +159,7 @@ export function removeModel(): void {
 }
 
 export function openModelFolder(): void {
-  void shell.openPath(modelDir())
+  console.log(`Folder model Whisper: ${modelDir()}`)
 }
 
 /** Whisper's language codes differ from ours only for Javanese. */
@@ -148,19 +180,15 @@ type Token = { text: string; t_dtw?: number }
 type JsonSegment = { text: string; offsets: { from: number; to: number }; tokens?: Token[] }
 
 /**
- * Word-level recognition of an audio file (any format FFmpeg reads). Times are in seconds.
- * Word starts come from DTW token alignment, which follows the voice far closer than whisper's own
- * segment times. No prompt is given: a prompt that repeats the script can make Whisper loop on a
- * phrase ("tidak tidak tidak ..."), and the captions take their spelling from the script anyway.
+ * Word-level recognition of an audio file. Times are in seconds.
  */
 export async function recognize(audio: string, language: string, tmp: string, signal?: AbortSignal): Promise<Heard[]> {
-  if (!whisperReady()) throw new Error('Model Whisper belum diunduh. Unduh dulu di Pengaturan.')
+  if (!whisperReady()) throw new Error('Model Whisper belum siap. Jalankan "bang-story whisper download" terlebih dahulu.')
   mkdirSync(tmp, { recursive: true })
   const wav = join(tmp, `whisper-${Date.now()}-${Math.random().toString(36).slice(2)}.wav`)
   await run(binPath(ffmpegStatic!), ['-hide_banner', '-y', '-i', audio, '-ar', '16000', '-ac', '1', '-c:a', 'pcm_s16le', wav], signal)
   const outBase = wav.replace(/\.wav$/, '')
   const threads = String(Math.max(2, Math.min(8, Math.floor(cpus().length / 2))))
-  // One word per segment (-ml 1 -sow), full JSON with DTW token times (DTW needs flash attention off).
   await run(
     cliPath(),
     ['-m', modelPath(), '-f', wav, '-l', whisperLanguage(language), '-ml', '1', '-sow', '-ojf', '-of', outBase, '-np', '-t', threads, '-nfa', '-dtw', 'small'],
@@ -174,7 +202,6 @@ export async function recognize(audio: string, language: string, tmp: string, si
     const start = dtw.length ? dtw[0].t_dtw! / 100 : s.offsets.from / 1000
     return { text: s.text, start, end: Math.max(start, s.offsets.to / 1000) }
   })
-  // Starts only move forward, and a word lasts until the next one starts at the latest.
   words.forEach((w, i) => {
     if (i > 0 && w.start < words[i - 1].start) w.start = words[i - 1].start
     w.end = Math.max(w.end, w.start)

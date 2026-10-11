@@ -1,7 +1,10 @@
-import { safeStorage } from 'electron'
+import dotenv from 'dotenv'
 import type { ApiProvider, KeyStatus } from '@shared/types'
 import { getDb } from './db'
 import { getSettings } from './settings'
+
+// Load .env automatically
+dotenv.config()
 
 const PROVIDERS: ApiProvider[] = ['higgsfield', 'gemini', 'elevenlabs', 'openrouter', 'groq', 'custom']
 
@@ -14,33 +17,25 @@ export const PROVIDER_NAMES: Record<ApiProvider, string> = {
   custom: 'endpoint custom'
 }
 
+export const PROVIDER_ENV_VARS: Record<ApiProvider, string[]> = {
+  higgsfield: ['HIGGSFIELD_API_KEY', 'HF_API_KEY'],
+  gemini: ['GEMINI_API_KEY', 'GOOGLE_API_KEY'],
+  elevenlabs: ['ELEVENLABS_API_KEY', 'ELEVEN_API_KEY'],
+  openrouter: ['OPENROUTER_API_KEY'],
+  groq: ['GROQ_API_KEY'],
+  custom: ['CUSTOM_API_KEY', 'OPENAI_API_KEY']
+}
+
 interface SecretRow {
   provider: ApiProvider
-  value: Buffer
+  value: Buffer | string
   last_ok: number | null
   last_message: string | null
   checked_at: number | null
 }
 
-/**
- * safeStorage (DPAPI on Windows) keeps its encryption key in Chromium's "Local State" file, which is only
- * written about ten seconds after the key is first created. Creating the key at startup means it is on disk
- * long before the user saves an API key, so killing the app (e.g. restarting the dev server) cannot orphan it.
- */
 export function warmUpEncryption(): void {
-  try {
-    if (safeStorage.isEncryptionAvailable()) safeStorage.encryptString('bang-story')
-  } catch {
-    // Encryption unavailable; keys fall back to plain storage below.
-  }
-}
-
-function decrypt(value: Buffer): string | null {
-  try {
-    return safeStorage.isEncryptionAvailable() ? safeStorage.decryptString(value) : value.toString('utf8')
-  } catch {
-    return null
-  }
+  // No-op for CLI
 }
 
 function mask(key: string): string {
@@ -53,43 +48,52 @@ function row(provider: ApiProvider): SecretRow | undefined {
 }
 
 export function setSecret(provider: ApiProvider, value: string): void {
-  const enc = safeStorage.isEncryptionAvailable() ? safeStorage.encryptString(value) : Buffer.from(value, 'utf8')
+  const buf = Buffer.from(value.trim(), 'utf8')
   getDb()
     .prepare(
       `INSERT INTO secrets (provider, value) VALUES (?, ?)
        ON CONFLICT(provider) DO UPDATE SET value = excluded.value, last_ok = NULL, last_message = NULL, checked_at = NULL`
     )
-    .run(provider, enc)
+    .run(provider, buf)
 }
 
 export function getSecret(provider: ApiProvider): string | null {
+  // 1. Check environment variables first
+  for (const envVar of PROVIDER_ENV_VARS[provider] ?? []) {
+    if (process.env[envVar]?.trim()) {
+      return process.env[envVar]!.trim()
+    }
+  }
+
+  // 2. Check SQLite database
   const r = row(provider)
-  if (!r || r.value.length === 0) return null
-  const value = decrypt(r.value)
-  if (value == null)
-    throw new Error(
-      `Kunci ${PROVIDER_NAMES[provider]} tersimpan tapi tidak bisa dibuka lagi (biasanya karena aplikasi ditutup paksa sesaat setelah kunci disimpan). Masukkan ulang kuncinya di Pengaturan.`
-    )
-  return value
+  if (!r || !r.value || r.value.length === 0) return null
+  if (Buffer.isBuffer(r.value)) {
+    return r.value.toString('utf8')
+  }
+  return String(r.value)
 }
 
 export function requireSecret(provider: ApiProvider): string {
   const key = getSecret(provider)
-  if (!key) throw new Error(`Kunci API ${PROVIDER_NAMES[provider]} belum diatur. Buka Pengaturan untuk menambahkannya.`)
+  if (!key) {
+    const envVars = (PROVIDER_ENV_VARS[provider] ?? []).join(' / ')
+    throw new Error(
+      `Kunci API ${PROVIDER_NAMES[provider]} belum diatur. Setel di file .env (${envVars}) atau jalankan 'bang-story config set-key ${provider} <kunci>'.`
+    )
+  }
   return key
 }
 
-/** Full key for the "show key" button; null when missing or unreadable. */
+/** Full key for display; null when missing. */
 export function revealSecret(provider: ApiProvider): string | null {
-  const r = row(provider)
-  return r && r.value.length ? decrypt(r.value) : null
+  return getSecret(provider)
 }
 
 export function clearSecret(provider: ApiProvider): void {
   getDb().prepare('DELETE FROM secrets WHERE provider = ?').run(provider)
 }
 
-/** Test results for the custom endpoint are kept even when it has no key (local servers). */
 export function recordCheck(provider: ApiProvider, ok: boolean, message: string): void {
   const now = Date.now()
   const res = getDb()
@@ -107,17 +111,16 @@ export function keyStatuses(): KeyStatus[] {
   const customUrl = getSettings().customBaseUrl.trim()
   return PROVIDERS.map((provider) => {
     const r = rows.find((x) => x.provider === provider)
-    const hasKey = !!r && r.value.length > 0
-    const value = hasKey ? decrypt(r!.value) : null
-    const unreadable = hasKey && value == null
+    const key = getSecret(provider)
+    const hasKey = !!key
     return {
       provider,
-      configured: provider === 'custom' ? !!customUrl : hasKey,
-      lastOk: unreadable ? false : r?.last_ok == null ? null : r.last_ok === 1,
-      lastMessage: unreadable ? 'Kunci tersimpan tapi tidak bisa dibuka lagi. Masukkan ulang kuncinya.' : (r?.last_message ?? null),
+      configured: provider === 'custom' ? !!customUrl || hasKey : hasKey,
+      lastOk: r?.last_ok == null ? (hasKey ? true : null) : r.last_ok === 1,
+      lastMessage: r?.last_message ?? (hasKey ? 'Tersedia' : 'Belum diatur'),
       checkedAt: r?.checked_at ?? null,
-      preview: value ? mask(value) : null,
-      unreadable
+      preview: key ? mask(key) : null,
+      unreadable: false
     }
   })
 }

@@ -1,6 +1,6 @@
 import type { Job } from '@shared/types'
-import { emit } from './events'
-import { getJobRaw, updateJob } from './repo'
+import { emit, eventBus } from './events'
+import { getJob, getJobRaw, updateJob } from './repo'
 import { cancelRequest } from './services/higgsfield'
 
 export type QueueName = 'higgsfield' | 'tts' | 'whisper' | 'export'
@@ -101,4 +101,81 @@ export async function cancelJob(id: string): Promise<void> {
 
 export function isActive(id: string): boolean {
   return controllers.has(id)
+}
+
+/** Waits for a single job to reach 'done', 'failed', or 'canceled'. */
+export function awaitJob(
+  jobId: string,
+  onProgress?: (progress: number, message?: string) => void,
+  signal?: AbortSignal
+): Promise<Job> {
+  return new Promise((resolve, reject) => {
+    const check = () => {
+      const raw = getJobRaw(jobId)
+      if (!raw) {
+        eventBus.off('job', onJob)
+        reject(new Error(`Job ${jobId} tidak ditemukan`))
+        return true
+      }
+      if (raw.status === 'done') {
+        eventBus.off('job', onJob)
+        const j = getJob(jobId)
+        if (j) resolve(j)
+        else reject(new Error(`Job ${jobId} tidak ditemukan setelah selesai`))
+        return true
+      }
+      if (raw.status === 'failed') {
+        eventBus.off('job', onJob)
+        reject(new Error(raw.error || `Job ${raw.kind} gagal`))
+        return true
+      }
+      if (raw.status === 'canceled') {
+        eventBus.off('job', onJob)
+        reject(new Error(`Job ${raw.kind} dibatalkan`))
+        return true
+      }
+      return false
+    }
+
+    if (check()) return
+
+    const onJob = (j: Job) => {
+      if (j.id === jobId) {
+        if (onProgress) onProgress(j.progress, j.message ?? undefined)
+        check()
+      }
+    }
+
+    eventBus.on('job', onJob)
+
+    if (signal) {
+      signal.addEventListener(
+        'abort',
+        () => {
+          eventBus.off('job', onJob)
+          void cancelJob(jobId)
+          reject(new Error('Dibatalkan'))
+        },
+        { once: true }
+      )
+    }
+  })
+}
+
+/** Waits for an array of jobs to finish. */
+export async function awaitJobs(
+  jobs: Job[],
+  onProgress?: (doneCount: number, total: number, lastJob: Job) => void,
+  signal?: AbortSignal
+): Promise<Job[]> {
+  let done = 0
+  const total = jobs.length
+  return Promise.all(
+    jobs.map(async (j) => {
+      const finished = await awaitJob(j.id, undefined, signal)
+      done++
+      onProgress?.(done, total, finished)
+      return finished
+    })
+  )
 }
